@@ -14,13 +14,14 @@ load_dotenv()  # 必须在导入其他模块之前加载
 import json
 import logging
 import threading
+from queue import Queue, Empty
 
 import lark_oapi as lark
 from lark_oapi.adapter.flask import *
 from lark_oapi.api.im.v1 import *
 
 from src.claude_code import chat_sync
-from src.feishu_utils.feishu_utils import send_message
+from src.feishu_utils.feishu_utils import send_message, reply_message
 from src.data_base_utils import get_session, save_session
 
 APP_ID = os.getenv("APP_ID")
@@ -28,6 +29,10 @@ APP_SECRET = os.getenv("APP_SECRET")
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
+
+# 正在处理中的 chat_id 队列（只保留未完成的）
+_active_queues: dict[str, Queue] = {}
+_queue_lock = threading.Lock()
 
 
 def chat_with_claude(chat_id: str, message: str) -> str:
@@ -48,12 +53,57 @@ def chat_with_claude(chat_id: str, message: str) -> str:
     return reply
 
 
+def _process_chat_queue(chat_id: str, message_id: str, chat_type: str, queue: Queue):
+    """
+    处理指定 chat_id 的消息队列（FIFO）
+    同一 chat_id 串行处理，不同 chat_id 可并行
+    """
+    while True:
+        # 在锁内检查并获取消息，确保线程安全
+        with _queue_lock:
+            if queue.empty():
+                # 队列空了，销毁并退出
+                _active_queues.pop(chat_id, None)
+                return
+            text = queue.get_nowait()
+        
+        try:
+            reply = chat_with_claude(chat_id, text)
+            if chat_type == "group":
+                reply_message(message_id, reply)
+            else:
+                send_message(chat_id, reply)
+            logger.info(f"回复: {reply[:100]}...")
+        except Exception as e:
+            logger.error(f"处理失败 [{chat_id[:8]}...]: {e}")
+
+
+def enqueue_message(chat_id: str, message_id: str, text: str, chat_type: str):
+    """
+    将消息加入队列，无队列则创建
+    """
+    with _queue_lock:
+        if chat_id in _active_queues:
+            # 已有队列，直接加入
+            _active_queues[chat_id].put(text)
+        else:
+            # 创建新队列并启动 worker
+            queue = Queue()
+            queue.put(text)
+            _active_queues[chat_id] = queue
+            threading.Thread(
+                target=_process_chat_queue,
+                args=(chat_id, message_id, chat_type, queue),
+                daemon=True
+            ).start()
+
+
 def handle_message(data: lark.im.v1.P2ImMessageReceiveV1) -> None:
     """处理接收到的消息"""
     try:
         event = data.event
         message = event.message
-        
+        message_id = message.message_id
         # 解析消息内容
         content = json.loads(message.content)
         text = content.get("text", "")
@@ -67,18 +117,10 @@ def handle_message(data: lark.im.v1.P2ImMessageReceiveV1) -> None:
             return
         
         chat_id = message.chat_id
-        logger.info(f"收到消息: {message.message_id}: {text}")
+        logger.info(f"收到消息: {message_id}: {text}")
         
-        # 异步线程处理，避免飞书超时重试
-        def process_async():
-            try:
-                reply = chat_with_claude(chat_id, text)
-                send_message(chat_id, reply)
-                logger.info(f"回复: {reply[:100]}...")
-            except Exception as e:
-                logger.error(f"异步处理失败: {e}")
-        
-        threading.Thread(target=process_async, daemon=True).start()
+        # 加入队列，按 chat_id 串行处理
+        enqueue_message(chat_id, message_id, text, message.chat_type)
         
     except Exception as e:
         logger.error(f"处理消息失败: {e}")
